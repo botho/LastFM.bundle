@@ -189,63 +189,137 @@ class LastFmAlbumAgent(Agent.Album):
     if manual:
       Log('Running custom search...')
     
-    albums = []
-    found_good_match = False
-    # First search for albums by artist if not 'Various Artists', if we don't get a good match, search directly.
+    # PROXY
+    # Determine if we should use legacy matching logic.
+    if ShouldProxy(media.parent_metadata.id + '/' + media.title):
+      Log('Using legacy album search logic to maximize cache hits.')
+      self.legacy_search(results, media, lang)
+    else:
+    # END PROXY  
+      albums = []
+      found_good_match = False
+      # First search for albums by artist if not 'Various Artists', if we don't get a good match, search directly.
+      if media.parent_metadata.id != 'Various%20Artists':
+        if not manual:
+          # Let's start with the first N albums (ideally a single API request)...
+          albums = self.score_albums(media, lang, GetAlbumsByArtist(media.parent_metadata.id, albums=[], limit=ARTIST_ALBUMS_LIMIT))
+          if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
+            # We found a good match in the first set of results, stop looking.
+            found_good_match = True
+            Log('Good album match found (quick search)  with score: ' + str(albums[0]['score']))
+        if not found_good_match or manual:
+          if manual:
+            Log('Custom search terms specified, fetching all albums by artist.')
+          else:
+            Log('No good matches found in first ' + str(len(albums)) + ' albums, fetching all albums by artist.')
+          albums = self.score_albums(media, lang, GetAlbumsByArtist(media.parent_metadata.id, albums=[]), manual=manual)
+          if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
+            Log('Good album match found with score: ' + str(albums[0]['score']))
+            found_good_match = True
+          else:
+            Log('No good matches found in ' + str(len(albums)) + ' albums by artist.')
+
+      # Either we're looking at Various Artists, or albums by artist search did not contain a good match.
+      if not found_good_match or albums:
+          albums = self.score_albums(media, lang, SearchAlbums(media.title.lower(), ALBUM_MATCH_LIMIT), manual=manual) + albums
+          if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
+            # Found a good match, stop looking.
+            found_good_match = True
+            Log('Found a good match for album search.')
+          if not albums or not found_good_match:
+            stripped_title = RE_STRIP_PARENS.sub('',media.title).lower()
+            if stripped_title != media.parent_metadata.id:
+              Log('No good matches found in album search for %s, searching for %s.' % (media.title.lower(), stripped_title))
+              # This time we extend the results  and re-sort so we consider the best-scoring matches from both searches.
+              albums  = self.score_albums(media, lang, SearchAlbums(stripped_title), manual=manual) + albums
+            if albums:
+              albums = sorted(albums, key=lambda k: k['score'], reverse=True)
+
+      # Dedupe albums.
+      seen = {}
+      deduped = []
+      for album in albums:
+        if album['id'] in seen:
+          continue
+        seen[album['id']] = True
+        deduped.append(album)
+      albums = deduped
+
+      Log('Found ' + str(len(albums)) + ' albums...')
+
+      for album in albums:
+        results.Append(MetadataSearchResult(id = album['id'], name = album['name'], lang = album['lang'], score = album['score']))
+
+  # PROXY
+  def legacy_search(self, results, media, lang):
+    if media.parent_metadata.id is None:
+      return None
+    #Log('album search for: ' + media.album)
+    if media.parent_metadata.id == '[Unknown Album]':
+      return
     if media.parent_metadata.id != 'Various%20Artists':
-      if not manual:
-        # Let's start with the first N albums (ideally a single API request)...
-        albums = self.score_albums(media, lang, GetAlbumsByArtist(media.parent_metadata.id, albums=[], limit=ARTIST_ALBUMS_LIMIT))
-        if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
-          # We found a good match in the first set of results, stop looking.
-          found_good_match = True
-          Log('Good album match found (quick search)  with score: ' + str(albums[0]['score']))
-      if not found_good_match or manual:
-        if manual:
-          Log('Custom search terms specified, fetching all albums by artist.')
-        else:
-          Log('No good matches found in first ' + str(len(albums)) + ' albums, fetching all albums by artist.')
-        albums = self.score_albums(media, lang, GetAlbumsByArtist(media.parent_metadata.id, albums=[]), manual=manual)
-        if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
-          Log('Good album match found with score: ' + str(albums[0]['score']))
-          found_good_match = True
-        else:
-          Log('No good matches found in ' + str(len(albums)) + ' albums by artist.')
+      for album in lastfm.ArtistAlbums(String.Unquote(media.parent_metadata.id)):
+        (name, artist, thumb, url) = album
+        albumID = url.split('/')[-1]
+        id = '/'.join(url.split('/')[-2:]).replace('+','%20')
+        dist = Util.LevenshteinDistance(name.lower(), media.album.lower())
+        # Sanity check to make sure we have SOME common substring.
+        longestCommonSubstring = len(Util.LongestCommonSubstring(name.lower(), media.album.lower()))
+        # If we don't have at least X% in common, then penalize the score
+        if (float(longestCommonSubstring) / len(media.album)) < .15: dist = dist + 10
+        #Log('scannerAlbum: ' + media.album + ' last.fmAlbum: ' + name + ' score=' + str(92-dist))
+        results.Append(MetadataSearchResult(id = id.replace('%2B','%20').replace('%25','%'), name = name, thumb = thumb, lang  = lang, score = 92-dist))
+    else:
+      (albums, more) = lastfm.SearchAlbums(media.title.lower())
+      for album in albums:
+        (name, artist, thumb, url) = album
+        if artist == 'Various Artists':
+          albumID = url.split('/')[-1]
+          id = media.parent_metadata.id + '/' + albumID.replace('+', '%20')
+          dist = Util.LevenshteinDistance(name.lower(), media.album.lower())
+          # Sanity check to make sure we have SOME common substring.
+          longestCommonSubstring = len(Util.LongestCommonSubstring(name.lower(), media.album.lower()))
+          # If we don't have at least X% in common, then penalize the score
+          if (float(longestCommonSubstring) / len(media.album)) < .15: dist = dist - 10
+          results.Append(MetadataSearchResult(id = id, name = name, thumb = thumb, lang  = lang, score = 85-dist))
+    results.Sort('score', descending=True)
+    for r in results[:5]:
+      #Track bonus on the top 5 closest title-based matches
+      trackBonus = self.legacy_bonus_album_match_using_tracks(media, r.id)
+      #except: trackBonus = 0
+      #Log('album: ' + media.title + ' trackBonus: ' + str(trackBonus))
+      r.score = r.score + trackBonus
+    results.Sort('score', descending=True)
+  
+  def legacy_bonus_album_match_using_tracks(self, media, id):
+    (artistName, albumName) = self.legacy_artist_album_from_id(id)
+    lastFM_albumTracks = []
+    Log('fetching AlbumTrackList for: ' + albumName)
+    #WAS:
+    #for track in lastfm.AlbumTrackList(artistName, albumName):
+    #  (trackName, artist, none1, trackUrl, none2) = track
+    album = XML.ElementFromURL(lastfm.ALBUM_INFO % (String.Quote(artistName, True), String.Quote(albumName, True)), sleep=0.7)
+    tracks = album.xpath('//track/name')
+    for track in tracks:
+      lastFM_albumTracks.append(track.text)
+    if len(lastFM_albumTracks) == 0: return 0 #no last.fm tracks for the album, so abort!
+    bonus = 0
+    for a in media.children:
+      track = a.title.lower()
+      for lft in lastFM_albumTracks:
+        score = Util.LevenshteinDistance(lft.lower(), track)
+        if score <= 2:
+          bonus += 1
+    if len(media.children) == len(tracks): bonus += 5
+    return bonus
 
-    # Either we're looking at Various Artists, or albums by artist search did not contain a good match.
-    if not found_good_match or albums:
-      # PROXY
-      # Only make these extra requests in the event of subpar AlbumsByArtist matches if we're okay with cache misses (old agent never makes them).
-      if ShouldProxy(media.parent_metadata.id + '/' + media.title) or media.parent_metadata.id == 'Various%20Artists':
-      # END PROXY  
-        albums = self.score_albums(media, lang, SearchAlbums(media.title.lower(), ALBUM_MATCH_LIMIT), manual=manual) + albums
-        if albums and albums[0]['score'] >= ALBUM_MATCH_GOOD_SCORE:
-          # Found a good match, stop looking.
-          found_good_match = True
-          Log('Found a good match for album search.')
-        if not albums or not found_good_match:
-          stripped_title = RE_STRIP_PARENS.sub('',media.title).lower()
-          if stripped_title != media.parent_metadata.id:
-            Log('No good matches found in album search for %s, searching for %s.' % (media.title.lower(), stripped_title))
-            # This time we extend the results  and re-sort so we consider the best-scoring matches from both searches.
-            albums  = self.score_albums(media, lang, SearchAlbums(stripped_title), manual=manual) + albums
-          if albums:
-            albums = sorted(albums, key=lambda k: k['score'], reverse=True)
+  def legacy_artist_album_from_id(self, id):
+    (artistName, albumName) = id.split('/') 
+    artistName = String.Unquote(artistName).encode('utf-8')
+    albumName = String.Unquote(albumName).encode('utf-8')
+    return (artistName, albumName)
+  # END PROXY
 
-    # Dedupe albums.
-    seen = {}
-    deduped = []
-    for album in albums:
-      if album['id'] in seen:
-        continue
-      seen[album['id']] = True
-      deduped.append(album)
-    albums = deduped
-
-    Log('Found ' + str(len(albums)) + ' albums...')
-
-    for album in albums:
-      results.Append(MetadataSearchResult(id = album['id'], name = album['name'], lang = album['lang'], score = album['score']))
 
   def score_albums(self, media, lang, albums, manual=False):
     res = []
